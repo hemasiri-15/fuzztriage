@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+data/*.db
+data/afl-output/
+data/bin/
+data/corpus/
+.pytest_cache/
+*.egg-info/
+node_modules/
+dist/
