@@ -1,0 +1,23 @@
+=================================================================
+==123456==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000004ff4 at pc 0x0000004d8a1a bp 0x7ffd8a1b2c30 sp 0x7ffd8a1b2428
+WRITE of size 4 at 0x602000004ff4 thread T0
+    #0 0x4d8a19 in decode_mcu_block /home/user/libjpeg-turbo/src/jdhuff.c:341:12
+    #1 0x4d7c40 in decode_image /home/user/libjpeg-turbo/src/jdmaster.c:78:5
+    #2 0x4d6a02 in jpeg_read_header /home/user/libjpeg-turbo/src/jdapimin.c:102:3
+    #3 0x4d1203 in main /home/user/libjpeg-turbo/src/djpeg.c:44:2
+    #4 0x7f8a1b03d0b2 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x270b2)
+
+0x602000004ff4 is located 4 bytes to the right of 64-byte region [0x602000004fb0,0x602000004ff0)
+allocated by thread T0 here:
+    #0 0x4c3a21 in malloc (/home/user/libjpeg-turbo/build/djpeg-static+0x4c3a21)
+    #1 0x4d5b18 in alloc_small /home/user/libjpeg-turbo/src/jmemmgr.c:159:14
+    #2 0x4d7ba0 in decode_image /home/user/libjpeg-turbo/src/jdmaster.c:70:9
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /home/user/libjpeg-turbo/src/jdhuff.c:341:12 in decode_mcu_block
+Shadow bytes around the buggy address:
+  0x0c047fff9fb0: fa fa fa fa fa fa fa fa fa fa fa fa 00 00 00 00
+  0x0c047fff9fc0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c047fff9fd0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c047fff9fe0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 fa fa
+=>0x0c047fff9ff0: fa fa fa fa[fa]fa fa fa fa fa fa fa fa fa fa fa
+==123456==ABORTING

@@ -1,0 +1,21 @@
+=================================================================
+==123789==ERROR: AddressSanitizer: heap-use-after-free on address 0x602000001a10 at pc 0x0000004e1203 bp 0x7ffd8a1b2c30 sp 0x7ffd8a1b2428
+READ of size 8 at 0x602000001a10 thread T0
+    #0 0x4e11ff in jpeg_free_large /home/user/libjpeg-turbo/src/jmemmgr.c:1103:5
+    #1 0x4e0aa2 in free_pool /home/user/libjpeg-turbo/src/jmemmgr.c:960:3
+    #2 0x4dfb10 in jpeg_destroy /home/user/libjpeg-turbo/src/jutils.c:196:2
+    #3 0x4d1240 in main /home/user/libjpeg-turbo/src/djpeg.c:210:3
+    #4 0x7f8a1b03d0b2 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x270b2)
+
+0x602000001a10 is located 16 bytes inside of 32-byte region [0x602000001a00,0x602000001a20)
+freed by thread T0 here:
+    #0 0x4c3f10 in free (/home/user/libjpeg-turbo/build/djpeg-static+0x4c3f10)
+    #1 0x4e0a55 in free_pool /home/user/libjpeg-turbo/src/jmemmgr.c:955:5
+    #2 0x4dfb00 in jpeg_destroy /home/user/libjpeg-turbo/src/jutils.c:194:3
+
+previously allocated by thread T0 here:
+    #0 0x4c3a21 in malloc (/home/user/libjpeg-turbo/build/djpeg-static+0x4c3a21)
+    #1 0x4d5b18 in alloc_small /home/user/libjpeg-turbo/src/jmemmgr.c:159:14
+
+SUMMARY: AddressSanitizer: heap-use-after-free /home/user/libjpeg-turbo/src/jmemmgr.c:1103:5 in jpeg_free_large
+==123789==ABORTING
