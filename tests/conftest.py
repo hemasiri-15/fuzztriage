@@ -38,6 +38,7 @@ _EXECUTABLE_FIXTURES = (
     "timeout_target.py",
     "asan_target.py",
     "signal_target.py",
+    "campaign_target.py",
 )
 
 
