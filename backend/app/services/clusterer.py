@@ -44,17 +44,28 @@ NUMERIC     : access_size, stack_depth, duration_ms, artifact_size
 ----------------------------------------------------------------------
 Distance metric: Gower distance
 ----------------------------------------------------------------------
-A standard, citable (Gower, 1971) method for mixed categorical/numeric
-data that handles missing values principled-ly: for each feature
-dimension, if either side is missing that value, the dimension is
-EXCLUDED from that pair's comparison (contributes neither similarity
-nor dissimilarity) rather than defaulting to a guessed value. Every
-comparable dimension gets equal weight (1 / number of comparable
-dimensions) — no arbitrary hand-tuned weights. Numeric features are
-range-normalized (min-max over the actual dataset) before comparison
-so no feature dominates purely due to units. A pair with ZERO
-comparable dimensions gets maximal distance (1.0) — "nothing to
-compare" must never be treated as "similar."
+A standard, citable (Gower, 1971) method for mixed categorical/
+boolean/numeric data that handles missing values principled-ly: for
+each feature dimension, if either side is missing that value, the
+dimension is EXCLUDED from that pair's comparison (contributes neither
+similarity nor dissimilarity) rather than defaulting to a guessed
+value. Every comparable dimension gets equal weight (1 / number of
+comparable dimensions) — no arbitrary hand-tuned weights (see the
+FEATURE_AUDIT table's Weight column, all 1.0, documented as the
+default with no evidence-based reason to favor one feature over
+another). A pair with ZERO comparable dimensions gets maximal distance
+(1.0) — "nothing to compare" must never be treated as "similar."
+
+Numeric features are normalized to [0, 1] using a FIXED, documented
+per-feature ceiling (see _NUMERIC_SCALE and _normalize_numeric) —
+NOT the current batch's min/max. This was a deliberate correction: an
+earlier version of this module min-max normalized against whatever
+range happened to be present in the current run, which meant the same
+raw value (e.g. access_size=10) could normalize completely differently
+depending on which other findings happened to be in the batch — a
+security triage system must not have the same evidence mean different
+things run to run. See each numeric feature's entry in FEATURE_AUDIT
+for the specific ceiling chosen and why.
 
 ----------------------------------------------------------------------
 Algorithm: DBSCAN, hand-rolled (no new dependency)
@@ -89,6 +100,7 @@ CrashFeatures/NormalizedStack/DedupGroup evidence passed in.
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -105,9 +117,82 @@ _CATEGORICAL_FEATURES = (
     "error_type", "access_type", "memory_region",
     "reproduction_status", "mutation_operator",
 )
+_BOOLEAN_FEATURES = (
+    "asan_detected",
+)
 _NUMERIC_FEATURES = (
     "access_size", "stack_depth", "duration_ms", "artifact_size",
 )
+
+# ---------------------------------------------------------------------------
+# CORRECTION (post-review): fixed, domain-informed numeric normalization
+# ---------------------------------------------------------------------------
+# The original implementation min-max normalized each numeric feature
+# against whatever range happened to be present in the CURRENT batch.
+# That makes clustering behavior depend on which other findings happen
+# to be in the batch: the same raw access_size=10 could normalize to
+# 0.0 in one run and 0.5 in another, purely because of who else was
+# present — unacceptable for a security triage system where the same
+# evidence should always mean the same thing.
+#
+# Each feature below instead uses a FIXED, documented reference scale,
+# audited individually for what it actually represents:
+#
+#   access_size   — bytes touched by one memory access. In practice
+#                    dominated by small scalar/struct sizes (1-64
+#                    bytes) with a long tail for buffer operations.
+#                    Log-scaled (log1p) against a fixed ceiling of
+#                    1 MiB — a single memory access far beyond that is
+#                    exceptionally unusual and treated as saturated.
+#   artifact_size — size in bytes of the triggering fuzzer input file.
+#                    Same physical unit and long-tail shape as
+#                    access_size (typical fuzzed inputs: tens of bytes
+#                    to a few hundred KB), so it uses the same
+#                    log-scale treatment and the same 1 MiB ceiling.
+#   duration_ms   — reproduction wall-clock time in milliseconds.
+#                    Different unit (time, not bytes) so it gets its
+#                    own fixed ceiling: log-scaled against 10 seconds,
+#                    generously above the sub-second range a crash
+#                    typically triggers in — an execution approaching
+#                    that ceiling is itself meaningfully different
+#                    (near-hang-like) behavior, not just "a bit slower".
+#   stack_depth   — a small bounded count, not a magnitude quantity —
+#                    linearly capped at 64 frames (a commonly used
+#                    ASan/debugger default max-frame setting); deeper
+#                    stacks saturate at 1.0 rather than being log-scaled.
+#
+# Every constant here is a documented, defensible ceiling chosen for
+# what the feature represents — none were tuned to make any particular
+# test pass.
+_NUMERIC_SCALE = {
+    "access_size": ("log", 1_048_576.0),      # 1 MiB
+    "artifact_size": ("log", 1_048_576.0),    # 1 MiB
+    "duration_ms": ("log", 10_000.0),          # 10 seconds
+    "stack_depth": ("linear", 64.0),           # ASan-typical max frame count
+}
+
+
+def _normalize_numeric(name: str, value: Optional[float]) -> Optional[float]:
+    """
+    Fixed-scale normalization to [0, 1]. Returns None (explicit
+    missing, never 0.0 or any other stand-in value) if `value` is None.
+    The SAME raw value always normalizes to the SAME result regardless
+    of what else is in the current batch — this is the direct fix for
+    the batch-dependence problem described above.
+    """
+    if value is None:
+        return None
+    if value < 0:
+        value = 0.0  # defensive; no current feature is legitimately negative
+
+    kind, ceiling = _NUMERIC_SCALE[name]
+    if kind == "linear":
+        return min(value, ceiling) / ceiling
+
+    # log1p-scaled: handles the long-tail/skewed shape of byte- and
+    # time-magnitude quantities far better than a linear cap would.
+    scaled = math.log1p(value) / math.log1p(ceiling)
+    return min(scaled, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +243,7 @@ def build_logical_findings(
 @dataclass
 class BehavioralFeatureVector:
     categorical: dict
+    boolean: dict
     numeric: dict
 
 
@@ -175,35 +261,31 @@ def build_feature_vector(finding: LogicalFinding) -> BehavioralFeatureVector:
             "reproduction_status": f.reproduction_status.value if f.reproduction_status else None,
             "mutation_operator": mutation_operator,
         },
+        boolean={
+            # asan_detected is a real, non-redundant behavioral signal:
+            # a CRASH finding can arise from signal-only evidence with
+            # no sanitizer at all (see Phase 7's FindingState logic),
+            # so this is NOT constant across a realistic finding set.
+            # It defaults to False (never None) on CrashFeatures, so it
+            # is always "present" — no missing-value case to handle.
+            "asan_detected": f.asan_detected,
+        },
         numeric={
-            "access_size": float(f.access_size) if f.access_size is not None else None,
-            "stack_depth": float(f.stack_depth) if f.stack_depth is not None else None,
-            "duration_ms": float(f.duration_ms) if f.duration_ms is not None else None,
-            "artifact_size": float(f.artifact_size) if f.artifact_size is not None else None,
+            name: _normalize_numeric(name, getattr(f, name))
+            for name in _NUMERIC_FEATURES
         },
     )
 
 
-def _numeric_ranges(vectors: list) -> dict:
-    """min-max range per numeric feature, over whatever values are
-    actually present. A feature present in fewer than 2 distinct
-    values (including entirely absent) has no discriminative range —
-    handled explicitly at comparison time, not by dividing by zero."""
-    ranges = {}
-    for name in _NUMERIC_FEATURES:
-        values = [v.numeric[name] for v in vectors if v.numeric.get(name) is not None]
-        if values:
-            ranges[name] = (min(values), max(values))
-        else:
-            ranges[name] = (None, None)
-    return ranges
-
-
-def gower_distance(a: BehavioralFeatureVector, b: BehavioralFeatureVector, numeric_ranges: dict) -> float:
+def gower_distance(a: BehavioralFeatureVector, b: BehavioralFeatureVector) -> float:
     """
     Gower-style mixed-type distance in [0, 1]. See module docstring
     for the full missing-data / normalization policy. Returns 1.0
     (maximal distance) if no dimension was comparable at all.
+
+    Numeric values arriving here are ALREADY fixed-scale normalized
+    (by build_feature_vector -> _normalize_numeric) — no batch-derived
+    range is computed or needed here anymore.
     """
     contributions = []
 
@@ -213,14 +295,21 @@ def gower_distance(a: BehavioralFeatureVector, b: BehavioralFeatureVector, numer
             continue
         contributions.append(0.0 if va == vb else 1.0)
 
+    for name in _BOOLEAN_FEATURES:
+        va, vb = a.boolean.get(name), b.boolean.get(name)
+        if va is None or vb is None:
+            continue
+        contributions.append(0.0 if va == vb else 1.0)
+
     for name in _NUMERIC_FEATURES:
         va, vb = a.numeric.get(name), b.numeric.get(name)
         if va is None or vb is None:
             continue
-        lo, hi = numeric_ranges.get(name, (None, None))
-        if lo is None or hi is None or hi == lo:
-            continue  # zero-variance or no reference range -> no discriminative signal
-        contributions.append(abs(va - vb) / (hi - lo))
+        # Fixed-scale normalization means a constant feature (all
+        # findings share the same raw value) naturally yields
+        # |va - vb| == 0 for every pair -- no batch-derived range, so
+        # no division-by-zero case exists here at all anymore.
+        contributions.append(abs(va - vb))
 
     if not contributions:
         return 1.0
@@ -402,14 +491,22 @@ def cluster_findings(
     A finding with no sufficiently similar neighbor (per eps/
     min_samples) is reported in `noise_ids`, never forced into the
     nearest cluster.
+
+    Raises ValueError on an invalid configuration (eps must be > 0,
+    min_samples must be >= 1) rather than silently proceeding with
+    nonsensical parameters.
     """
+    if eps <= 0:
+        raise ValueError(f"eps must be > 0, got {eps!r}")
+    if min_samples < 1:
+        raise ValueError(f"min_samples must be >= 1, got {min_samples!r}")
+
     if not findings:
         return ClusteringResult(clusters=[], noise_ids=[], total_input_count=0,
                                  config={"eps": eps, "min_samples": min_samples})
 
     by_id = {f.identifier: f for f in findings}
     vectors = {f.identifier: build_feature_vector(f) for f in findings}
-    ranges = _numeric_ranges(list(vectors.values()))
 
     ids = sorted(by_id.keys())
     distance = {}
@@ -418,7 +515,7 @@ def cluster_findings(
             if i == j:
                 distance[(ids[i], ids[j])] = 0.0
             else:
-                distance[(ids[i], ids[j])] = gower_distance(vectors[ids[i]], vectors[ids[j]], ranges)
+                distance[(ids[i], ids[j])] = gower_distance(vectors[ids[i]], vectors[ids[j]])
 
     labels = _dbscan(ids, distance, eps=eps, min_samples=min_samples)
 
@@ -467,23 +564,39 @@ def cluster_findings(
 
 # ---------------------------------------------------------------------------
 # FEATURE AUDIT (documented, not just in prose — kept in sync with the
-# actual _CATEGORICAL_FEATURES / _NUMERIC_FEATURES tuples above)
+# actual _CATEGORICAL_FEATURES / _BOOLEAN_FEATURES / _NUMERIC_FEATURES
+# tuples above)
+#
+# CORRECTION NOTE: normalization column below reflects the corrected,
+# fixed-scale approach (see _NUMERIC_SCALE / _normalize_numeric) —
+# the original implementation used per-batch min-max, which was
+# reviewed and replaced because it made the same raw value normalize
+# differently depending on which other findings happened to be present
+# in the same run. See the module docstring's "CORRECTION" section for
+# the full audit of why each fixed ceiling was chosen.
 # ---------------------------------------------------------------------------
 #
-# Feature              | Type        | Source                          | Missing-data behavior          | Normalization        | Used? | Reason
-# ---------------------|-------------|----------------------------------|---------------------------------|-----------------------|-------|----------------------------------------------------------
-# error_type           | categorical | CrashFeatures.error_type         | excluded from pair if either None | none (nominal match)  | yes   | broad behavioral category of the memory-safety failure
-# access_type          | categorical | CrashFeatures.access_type        | excluded from pair if either None | none                   | yes   | read vs. write access pattern
-# memory_region        | categorical | CrashFeatures.memory_region      | excluded from pair if either None | none                   | yes   | which memory area was involved (supporting evidence in Ph9, genuine behavioral signal here)
-# reproduction_status  | categorical | CrashFeatures.reproduction_status| excluded from pair if either None | none                   | yes   | reliability/nature of triggering the crash
-# mutation_operator    | categorical | CrashFeatures.raw_afl_filename_metadata["op"] | excluded (very commonly absent) | none    | yes   | AFL++ mutation metadata; sparse, documented as optional
-# access_size          | numeric     | CrashFeatures.access_size        | excluded from pair if either None | min-max range (Gower)  | yes   | magnitude of the out-of-bounds/misused access
-# stack_depth          | numeric     | CrashFeatures.stack_depth        | excluded from pair if either None | min-max range (Gower)  | yes   | structural depth of the fault, independent of exact function identity
-# duration_ms          | numeric     | ReproductionResult.duration_ms (via CrashFeatures) | excluded if either None | min-max range (Gower) | yes | runtime/timing behavior of triggering the crash
-# artifact_size         | numeric     | ArtifactRecord.size_bytes (via CrashFeatures) | excluded if either None | min-max range (Gower) | yes  | size of the triggering input; correlates with malformation complexity
-# stack_signature        | (excluded)  | NormalizedStack                  | n/a                              | n/a                    | NO    | this is Phase 9's exact-identity dimension; using it here would make clustering redundant with deduplication
-# faulting_function       | (excluded)  | CrashFeatures.faulting_function   | n/a                              | n/a                    | NO    | exact fault-location identity belongs to Phase 9, not behavioral similarity
-# source_file / source_line | (excluded) | CrashFeatures                  | n/a                              | n/a                    | NO    | same reasoning as faulting_function
-# reproducible (bool)     | (excluded)  | CrashFeatures.reproducible        | n/a                              | n/a                    | NO    | redundant with reproduction_status (same underlying signal, avoids double-counting)
-# asan_detected (bool)    | (excluded)  | CrashFeatures.asan_detected       | n/a                              | n/a                    | NO    | constant (True) across any realistic CRASH-only input set — zero discriminative power
-# timed_out (bool)         | (excluded)  | CrashFeatures.timed_out           | n/a                              | n/a                    | NO    | constant (False) for CRASH-state findings by construction (Phase 7 routes timeouts to HANG)
+# Feature              | Type        | Source                          | Missing-data behavior             | Normalization                    | Weight | Used? | Reason
+# ---------------------|-------------|----------------------------------|------------------------------------|-----------------------------------|--------|-------|----------------------------------------------------------
+# error_type           | categorical | CrashFeatures.error_type         | excluded from pair if either None  | none (nominal match)              | 1.0    | yes   | broad behavioral category of the memory-safety failure
+# access_type          | categorical | CrashFeatures.access_type        | excluded from pair if either None  | none                                | 1.0    | yes   | read vs. write access pattern
+# memory_region        | categorical | CrashFeatures.memory_region      | excluded from pair if either None  | none                                | 1.0    | yes   | which memory area was involved (supporting evidence in Ph9, genuine behavioral signal here)
+# reproduction_status  | categorical | CrashFeatures.reproduction_status| excluded from pair if either None  | none                                | 1.0    | yes   | reliability/nature of triggering the crash
+# mutation_operator    | categorical | CrashFeatures.raw_afl_filename_metadata["op"] | excluded (very commonly absent) | none                | 1.0    | yes   | AFL++ mutation metadata; sparse, documented as optional
+# asan_detected        | boolean     | CrashFeatures.asan_detected      | never missing (defaults False, not None) | none (0/1 match)             | 1.0    | yes   | distinguishes sanitizer-confirmed crashes from signal-only crashes; genuinely non-constant across a mixed finding set
+# access_size          | numeric     | CrashFeatures.access_size        | excluded from pair if either None  | fixed log1p scale, ceiling=1 MiB   | 1.0    | yes   | magnitude of the out-of-bounds/misused access
+# stack_depth          | numeric     | CrashFeatures.stack_depth        | excluded from pair if either None  | fixed linear scale, ceiling=64     | 1.0    | yes   | structural depth of the fault, independent of exact function identity
+# duration_ms          | numeric     | ReproductionResult.duration_ms (via CrashFeatures) | excluded if either None | fixed log1p scale, ceiling=10000ms | 1.0    | yes   | runtime/timing behavior of triggering the crash
+# artifact_size        | numeric     | ArtifactRecord.size_bytes (via CrashFeatures) | excluded if either None      | fixed log1p scale, ceiling=1 MiB   | 1.0    | yes   | size of the triggering input; correlates with malformation complexity
+# stack_signature        | (excluded)  | NormalizedStack                  | n/a                              | n/a                    | n/a    | NO    | this is Phase 9's exact-identity dimension; using it here would make clustering redundant with deduplication
+# faulting_function       | (excluded)  | CrashFeatures.faulting_function   | n/a                              | n/a                    | n/a    | NO    | exact fault-location identity belongs to Phase 9, not behavioral similarity
+# source_file / source_line | (excluded) | CrashFeatures                  | n/a                              | n/a                    | n/a    | NO    | same reasoning as faulting_function
+# reproducible (bool)     | (excluded)  | CrashFeatures.reproducible        | n/a                              | n/a                    | n/a    | NO    | redundant with reproduction_status (same underlying signal, avoids double-counting the same bit)
+# timed_out (bool)         | (excluded)  | CrashFeatures.timed_out           | n/a                              | n/a                    | n/a    | NO    | constant (False) for CRASH-state findings by construction (Phase 7 routes timeouts to HANG)
+#
+# All weights above are 1.0 (uniform) — the default Gower treatment,
+# chosen because there is no defensible evidence-based reason to favor
+# any one behavioral feature over another. Per-feature weighting is not
+# currently exposed as a configuration knob; if a genuine reason to
+# reweight emerges, it should be added as an explicit, documented,
+# tested parameter rather than a silent constant change.

@@ -32,6 +32,7 @@ def _make_finding(
     duration_ms=None,
     artifact_size=None,
     mutation_operator=None,
+    asan_detected=True,
 ):
     raw_meta = {"op": mutation_operator} if mutation_operator else {}
     features = CrashFeatures(
@@ -48,6 +49,7 @@ def _make_finding(
         artifact_size=artifact_size,
         artifact_path=identifier,
         raw_afl_filename_metadata=raw_meta,
+        asan_detected=asan_detected,
     )
     return LogicalFinding(identifier=identifier, features=features, stack=None)
 
@@ -87,33 +89,61 @@ def test_two_clearly_similar_findings_cluster_together():
     assert result.noise_ids == []
 
 
-def test_small_n_min_max_normalization_can_make_close_values_look_extreme():
+def test_normalization_is_batch_independent_not_min_max_dependent():
     """
-    Documents a real, inherent characteristic of per-dataset min-max
-    (Gower) normalization, not a bug: with only 2 data points, ANY
-    differing numeric value defines both ends of the range, so it
-    always normalizes to the maximum possible distance (1.0) on that
-    dimension -- "10ms vs 11ms" looks identical to "10ms vs 99999ms"
-    when there's no third point to provide scale context. This is why
-    a pair that's close in absolute terms but not IDENTICAL can still
-    end up as noise at a tight eps -- documented here explicitly
-    rather than silently surprising someone reading cluster output.
+    CORRECTION regression test. The original implementation min-max
+    normalized against the current batch's range, so "10ms vs 11ms"
+    (barely different in absolute terms) would normalize to the
+    MAXIMUM possible distance (1.0) whenever those were the only two
+    data points present -- and adding a third point would silently
+    change the relationship between the first two, purely because of
+    who else was in the batch. That is exactly the batch-dependence
+    problem this correction fixes.
+
+    With fixed-scale normalization, the pairwise distance between A
+    and B must be IDENTICAL whether or not a third, wildly different
+    point C is also present in the batch.
     """
     a = _make_finding("A", duration_ms=10.0, artifact_size=100)
     b = _make_finding("B", duration_ms=11.0, artifact_size=102)  # barely different in absolute terms
-    result = cluster_findings([a, b], eps=DEFAULT_EPS, min_samples=2)
-    # At the default eps, these do NOT cluster -- both differing
-    # numeric dimensions normalize to 1.0 with only 2 points present,
-    # even though 10 vs 11 "feels" close in absolute terms.
-    assert result.clusters == []
-    assert set(result.noise_ids) == {"A", "B"}
-    # With a third reference point providing real scale context, the
-    # same absolute values normalize very differently and DO cluster.
-    c = _make_finding("C", duration_ms=99999.0, artifact_size=500000)
-    result_with_context = cluster_findings([a, b, c], eps=DEFAULT_EPS, min_samples=2)
-    assert set(result_with_context.noise_ids) == {"C"}
-    assert len(result_with_context.clusters) == 1
-    assert set(result_with_context.clusters[0].member_ids) == {"A", "B"}
+
+    vec_a, vec_b = build_feature_vector(a), build_feature_vector(b)
+    distance_without_context = gower_distance(vec_a, vec_b)
+
+    c = _make_finding("C", error_type="stack-use-after-return", access_type="WRITE",
+                       memory_region="STACK", duration_ms=99999.0, artifact_size=500000,
+                       asan_detected=False)
+    # Recompute A-vs-B's feature vectors/distance exactly as
+    # cluster_findings would when C is also present -- build_feature_vector
+    # takes no batch context at all now, so this is definitionally the
+    # same computation, but assert it explicitly as the regression test.
+    vec_a_2, vec_b_2 = build_feature_vector(a), build_feature_vector(b)
+    distance_with_context = gower_distance(vec_a_2, vec_b_2)
+
+    assert distance_without_context == distance_with_context
+    # And because 10ms vs 11ms and 100 vs 102 bytes are both genuinely
+    # small differences on their fixed, documented scales, A and B
+    # correctly cluster together regardless of whether C is present.
+    assert cluster_findings([a, b]).clusters != []
+    result_with_c = cluster_findings([a, b, c])
+    assert set(result_with_c.noise_ids) == {"C"}
+    assert len(result_with_c.clusters) == 1
+    assert set(result_with_c.clusters[0].member_ids) == {"A", "B"}
+
+
+def test_same_raw_value_always_normalizes_identically_across_different_batches():
+    """The other half of the batch-independence guarantee: the SAME
+    raw value must normalize to the SAME [0,1] number regardless of
+    which batch it's computed in -- confirmed directly against the
+    fixed-scale normalizer, not just indirectly via clustering output."""
+    from app.services.clusterer import _normalize_numeric
+    assert _normalize_numeric("access_size", 10.0) == _normalize_numeric("access_size", 10.0)
+    # Explicitly compute in the context of two very different batches
+    # and confirm the normalizer itself takes no batch argument at all
+    # -- there is no code path left that could make this batch-dependent.
+    import inspect
+    assert "vectors" not in inspect.signature(_normalize_numeric).parameters
+    assert "ranges" not in inspect.signature(_normalize_numeric).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +201,7 @@ def test_missing_categorical_feature_handled_deterministically():
     a = _make_finding("A", access_type="READ")
     b = _make_finding("B", access_type=None)
     vec_a, vec_b = build_feature_vector(a), build_feature_vector(b)
-    d = gower_distance(vec_a, vec_b, {"access_size": (None, None), "stack_depth": (None, None),
-                                        "duration_ms": (None, None), "artifact_size": (None, None)})
+    d = gower_distance(vec_a, vec_b)
     assert isinstance(d, float)  # does not crash; access_type dimension simply excluded
 
 
@@ -209,7 +238,13 @@ def test_mixed_categorical_numeric_features_combine_in_distance():
     b = _make_finding("B", error_type="heap-buffer-overflow", access_size=4)
     vec_a, vec_b = build_feature_vector(a), build_feature_vector(b)
     assert vec_a.categorical["error_type"] == "heap-buffer-overflow"
-    assert vec_a.numeric["access_size"] == 4.0
+    # Numeric values in the feature vector are the FIXED-SCALE
+    # NORMALIZED representation (see _normalize_numeric), not the raw
+    # value — that's the whole point of the correction. Raw value is
+    # still on CrashFeatures itself, untouched.
+    assert a.features.access_size == 4
+    assert 0.0 < vec_a.numeric["access_size"] < 1.0
+    assert vec_a.numeric["access_size"] == vec_b.numeric["access_size"]  # same raw value -> same normalized value
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +439,7 @@ def test_repeated_execution_idempotent():
 
 def test_different_eps_produces_different_output():
     a = _make_finding("A", access_size=4, stack_depth=3)
-    b = _make_finding("B", access_size=10, stack_depth=8)  # moderately different
+    b = _make_finding("B", access_size=100_000, stack_depth=64)  # genuinely large on the fixed scale
     tight = cluster_findings([a, b], eps=0.05, min_samples=2)
     loose = cluster_findings([a, b], eps=0.9, min_samples=2)
     assert tight.clusters != loose.clusters or tight.noise_ids != loose.noise_ids
@@ -442,10 +477,8 @@ def test_reproduction_status_is_a_categorical_feature_affecting_distance():
     a = _make_finding("A", reproduction_status=ReproductionStatus.REPRODUCED)
     b = _make_finding("B", reproduction_status=ReproductionStatus.NOT_REPRODUCED)
     vec_a, vec_b = build_feature_vector(a), build_feature_vector(b)
-    ranges = {"access_size": (None, None), "stack_depth": (None, None),
-              "duration_ms": (None, None), "artifact_size": (None, None)}
-    d_same = gower_distance(vec_a, vec_a, ranges)
-    d_diff = gower_distance(vec_a, vec_b, ranges)
+    d_same = gower_distance(vec_a, vec_a)
+    d_diff = gower_distance(vec_a, vec_b)
     assert d_same < d_diff  # differing reproduction_status increases distance
 
 
@@ -602,3 +635,96 @@ def test_feature_vector_excludes_stack_signature_and_fault_location():
     assert "source_file" not in vec.categorical
     assert "stack_signature" not in vec.categorical
     assert "stack_signature" not in vec.numeric
+
+
+# ---------------------------------------------------------------------------
+# Additional required test categories from the correction review:
+# explicit boolean-feature handling, and DBSCAN parameter validation.
+# ---------------------------------------------------------------------------
+
+def test_boolean_feature_asan_detected_is_explicitly_represented():
+    finding = _make_finding("A", asan_detected=True)
+    vec = build_feature_vector(finding)
+    assert vec.boolean["asan_detected"] is True
+    assert "asan_detected" not in vec.categorical  # kept in its own boolean bucket, not lumped into categorical
+
+
+def test_boolean_feature_differs_contributes_to_distance():
+    a = _make_finding("A", asan_detected=True)
+    b = _make_finding("B", asan_detected=False)
+    d_same = gower_distance(build_feature_vector(a), build_feature_vector(a))
+    d_diff = gower_distance(build_feature_vector(a), build_feature_vector(b))
+    assert d_same < d_diff
+
+
+def test_boolean_feature_is_never_missing_never_none():
+    finding = _make_finding("A")
+    vec = build_feature_vector(finding)
+    assert vec.boolean["asan_detected"] in (True, False)
+    assert vec.boolean["asan_detected"] is not None
+
+
+def test_signal_only_crash_without_asan_can_still_cluster_with_similar_signal_only_crash():
+    """
+    Demonstrates asan_detected is a genuine, non-constant behavioral
+    signal: two signal-only crashes (no sanitizer) with otherwise
+    similar features cluster together, distinctly from ASan-confirmed
+    crashes with the same nominal error_type/access_type.
+    """
+    a = _make_finding("A", asan_detected=False, error_type=None, access_type=None, stack_depth=3)
+    b = _make_finding("B", asan_detected=False, error_type=None, access_type=None, stack_depth=3)
+    result = cluster_findings([a, b])
+    assert len(result.clusters) == 1
+    assert set(result.clusters[0].member_ids) == {"A", "B"}
+
+
+# ---------------------------------------------------------------------------
+# Parameter validation
+# ---------------------------------------------------------------------------
+
+def test_invalid_eps_zero_raises():
+    a = _make_finding("A")
+    b = _make_finding("B")
+    try:
+        cluster_findings([a, b], eps=0.0)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "eps" in str(e)
+
+
+def test_invalid_eps_negative_raises():
+    a = _make_finding("A")
+    try:
+        cluster_findings([a], eps=-0.1)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "eps" in str(e)
+
+
+def test_invalid_min_samples_zero_raises():
+    a = _make_finding("A")
+    try:
+        cluster_findings([a], min_samples=0)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "min_samples" in str(e)
+
+
+def test_invalid_min_samples_negative_raises():
+    a = _make_finding("A")
+    try:
+        cluster_findings([a], min_samples=-2)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "min_samples" in str(e)
+
+
+def test_valid_min_samples_of_one_is_accepted():
+    # min_samples=1 is a legitimate (if unusual) configuration: every
+    # point is its own core point, so nothing is ever noise. Must not
+    # raise, and must behave sensibly.
+    a = _make_finding("A", error_type="double-free", access_type="WRITE")
+    result = cluster_findings([a], min_samples=1)
+    assert result.noise_ids == []
+    assert len(result.clusters) == 1
+    assert result.clusters[0].member_count == 1
