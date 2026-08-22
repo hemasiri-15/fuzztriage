@@ -106,3 +106,36 @@ def get_settings() -> Settings:
     if _settings is None:
         _settings = load_settings()
     return _settings
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 addition: API data-root resolution.
+#
+# Deliberately kept SEPARATE from Settings/load_settings() above rather
+# than added as a 5th required field on Settings. No Phase 1-12 code
+# path calls get_settings() at all (confirmed by inspection before
+# writing this) -- run_pipeline() always takes an explicit directory
+# argument. Adding a new required field to Settings would have forced
+# every existing (and future non-API) caller to also set
+# FUZZTRIAGE_DATA_ROOT even though they never use it, for no reason.
+# Only the API layer (backend/app/security.py) calls get_data_root().
+# ---------------------------------------------------------------------------
+_DATA_ROOT_VAR = "FUZZTRIAGE_DATA_ROOT"
+
+
+def get_data_root(env: dict | None = None) -> Path:
+    """
+    Resolve the configured root directory that all API-supplied
+    campaign paths must stay inside of (see backend/app/security.py).
+    Raises ConfigError if not set -- there is no defensible default
+    for "which directories on this machine may be analyzed".
+    """
+    source = env if env is not None else os.environ
+    value = source.get(_DATA_ROOT_VAR)
+    if not value:
+        raise ConfigError(
+            f"{_DATA_ROOT_VAR} is not set. The API requires a configured data root "
+            f"that campaign paths are validated against, e.g.:\n"
+            f"    {_DATA_ROOT_VAR}=./data/afl-output"
+        )
+    return Path(value).expanduser().resolve()
